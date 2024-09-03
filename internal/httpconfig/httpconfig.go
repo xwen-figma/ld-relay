@@ -2,8 +2,11 @@
 package httpconfig
 
 import (
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/launchdarkly/ld-relay/v8/internal/credential"
 
@@ -34,6 +37,9 @@ func NewHTTPConfig(proxyConfig config.ProxyConfig, authKey credential.SDKCredent
 	configBuilder.UserAgent(userAgent)
 
 	ret := HTTPConfig{ProxyConfig: proxyConfig}
+
+	// This requires go SDK changes first to support custom TLS config
+	configBuilder.CustomPeerCertificateVerification(customVerifyPeerCertificate)
 
 	authKeyStr := ""
 	if authKey != nil {
@@ -83,6 +89,37 @@ func NewHTTPConfig(proxyConfig config.ProxyConfig, authKey credential.SDKCredent
 	ret.SDKHTTPConfigFactory = configBuilder
 	ret.SDKHTTPConfig, err = configBuilder.Build(subsystems.BasicClientContext{SDKKey: authKeyStr})
 	return ret, err
+}
+
+func customVerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+	cert, err := x509.ParseCertificate(rawCerts[0])
+	if err != nil {
+		return fmt.Errorf("failed to parse certificate: %v", err)
+	}
+
+	actualHost := cert.Subject.CommonName
+	verifyHost := determineVerifyHost(actualHost)
+
+	opts := x509.VerifyOptions{
+		DNSName: verifyHost,
+		Roots:   nil, // Use system root CA store
+	}
+
+	_, err = cert.Verify(opts)
+	if err != nil {
+		return fmt.Errorf("certificate verification failed for %s (verifying as %s): %v", actualHost, verifyHost, err)
+	}
+
+	return nil
+}
+
+func determineVerifyHost(actualHost string) string {
+	// If the actual host is an AWS VPC endpoint, we should use the original server name for the TLS.
+	// Currently the LD PrivateLink only supports the events service.
+	if strings.HasSuffix(actualHost, ".vpce.amazonaws.com") {
+		return "events.launchdarkly.com"
+	}
+	return actualHost
 }
 
 // Client creates a new HTTP client instance that isn't for SDK use.
